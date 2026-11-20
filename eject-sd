@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# eject-sd - Eject SD card (slot bawaan laptop maupun card reader USB)
+# Dependensi: udisks2 (udisksctl), zenity, libnotify-bin (notify-send)
+#
+
+set -uo pipefail
+
+NOTIFY_MS=4000  # notifikasi hilang otomatis setelah 4 detik
+
+notify() {
+    # $1 = judul, $2 = pesan, $3 = icon (opsional)
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -t "$NOTIFY_MS" -i "${3:-media-flash-sd-mmc}" "$1" "$2"
+    else
+        echo "$1: $2"
+    fi
+}
+
+# 1. Cari disk SD card:
+#    a) slot SD bawaan laptop -> device bernama mmcblk*
+#    b) card reader USB -> disk USB yang vendor/model-nya mengandung kata card/reader/sd/mmc
+declare -a sd_devs=()
+
+while read -r name; do
+    [ -n "$name" ] && sd_devs+=("$name")
+done < <(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 ~ /^mmcblk[0-9]+$/ {print $1}')
+
+while read -r name; do
+    [ -z "$name" ] && continue
+    info=$(lsblk -dn -o VENDOR,MODEL "/dev/$name" 2>/dev/null)
+    if echo "$info" | grep -qiE 'card|reader|sd|mmc'; then
+        sd_devs+=("$name")
+    fi
+done < <(lsblk -dn -o NAME,TRAN 2>/dev/null | awk '$2=="usb"{print $1}')
+
+if [ ${#sd_devs[@]} -eq 0 ]; then
+    notify "Eject SD Card" "Tidak ada SD card yang terdeteksi." "dialog-warning"
+    exit 0
+fi
+
+# 2. Bangun nama yang mudah dibaca (label volume + model + ukuran)
+declare -a display_names=()
+declare -a dev_paths=()
+
+for dev in "${sd_devs[@]}"; do
+    devpath="/dev/$dev"
+    vendor=$(lsblk -dn -o VENDOR "$devpath" 2>/dev/null | xargs)
+    model=$(lsblk -dn -o MODEL "$devpath" 2>/dev/null | xargs)
+    size=$(lsblk -dn -o SIZE "$devpath" 2>/dev/null | xargs)
+    label=$(lsblk -n -o LABEL "$devpath" 2>/dev/null | grep -v '^$' | head -n1)
+
+    name=$(echo "$vendor $model" | xargs)
+    [ -z "$name" ] && name="SD Card"
+    [ -n "$label" ] && name="$label - $name"
+    [ -n "$size" ] && name="$name ($size)"
+
+    display_names+=("$name")
+    dev_paths+=("$devpath")
+done
+
+# 3. Pilih SD card: otomatis kalau cuma satu, dialog kalau lebih dari satu
+selected_index=0
+
+if [ ${#sd_devs[@]} -gt 1 ]; then
+    if command -v zenity >/dev/null 2>&1; then
+        zenity_args=()
+        for i in "${!display_names[@]}"; do
+            zenity_args+=("$i" "${display_names[$i]}")
+        done
+
+        result=$(zenity --list \
+            --title="Eject SD Card" \
+            --text="Pilih SD card yang mau di-eject:" \
+            --column="ID" --column="Nama SD Card" \
+            --hide-column=1 --print-column=1 \
+            --width=480 --height=320 \
+            "${zenity_args[@]}")
+
+        [ -z "$result" ] && exit 0
+        selected_index="$result"
+    else
+        echo "Pilih SD card yang mau di-eject:"
+        select opt in "${display_names[@]}"; do
+            if [ -n "$opt" ]; then
+                selected_index=$((REPLY - 1))
+                break
+            fi
+        done
+    fi
+fi
+
+devpath="${dev_paths[$selected_index]}"
+selected_name="${display_names[$selected_index]}"
+
+# 4. Unmount semua partisi SD card
+unmount_ok=1
+for part in $(lsblk -ln -o NAME "$devpath" 2>/dev/null | tail -n +2); do
+    if ! out=$(udisksctl unmount -b "/dev/$part" 2>&1); then
+        echo "$out" | grep -qi "not mounted" || unmount_ok=0
+    fi
+done
+
+if [ "$unmount_ok" -eq 0 ]; then
+    notify "Eject SD Card" "Gagal unmount $selected_name (masih dipakai proses lain)." "dialog-error"
+    exit 1
+fi
+
+# 5. Power off. Slot SD bawaan laptop biasanya tidak mendukung power-off,
+#    tapi kalau unmount sudah berhasil kartu tetap aman dicabut.
+if udisksctl power-off -b "$devpath" >/dev/null 2>&1; then
+    notify "Eject SD Card" "Berhasil: $selected_name aman dicabut."
+else
+    notify "Eject SD Card" "Berhasil di-unmount: $selected_name aman dicabut."
+fi

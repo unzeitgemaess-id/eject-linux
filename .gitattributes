@@ -1,0 +1,5 @@
+* text=auto
+install.sh text eol=lf
+uninstall.sh text eol=lf
+eject-usb text eol=lf
+eject-sd text eol=lf

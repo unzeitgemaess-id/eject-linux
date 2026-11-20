@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# eject-usb - Eject flashdisk/USB drive dengan memilih dari daftar nama
+# Dependensi: udisks2 (udisksctl), zenity, libnotify-bin (notify-send)
+#
+
+set -uo pipefail
+
+notify() {
+    # $1 = judul, $2 = pesan, $3 = icon (opsional)
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -t 4000 -i "${3:-drive-removable-media}" "$1" "$2"
+    else
+        echo "$1: $2"
+    fi
+}
+
+# 1. Cari semua disk yang terhubung via USB (bukan partisi, hanya disk utama)
+mapfile -t usb_devs < <(lsblk -dn -o NAME,TRAN 2>/dev/null | awk '$2=="usb"{print $1}')
+
+if [ ${#usb_devs[@]} -eq 0 ]; then
+    notify "Eject USB" "Tidak ada flashdisk USB yang terdeteksi." "dialog-warning"
+    exit 0
+fi
+
+# 2. Bangun daftar nama yang human-readable untuk tiap disk
+declare -a display_names
+declare -a dev_paths
+
+for dev in "${usb_devs[@]}"; do
+    devpath="/dev/$dev"
+    vendor=$(lsblk -dn -o VENDOR "$devpath" 2>/dev/null | xargs)
+    model=$(lsblk -dn -o MODEL "$devpath" 2>/dev/null | xargs)
+    size=$(lsblk -dn -o SIZE "$devpath" 2>/dev/null | xargs)
+    # Ambil label partisi pertama yang tidak kosong (nama volume, mis. "DATA", "KINGSTON")
+    label=$(lsblk -n -o LABEL "$devpath" 2>/dev/null | grep -v '^$' | head -n1)
+
+    name="${vendor} ${model}"
+    name=$(echo "$name" | xargs)  # trim spasi berlebih
+    [ -z "$name" ] && name="USB Drive"
+    [ -n "$label" ] && name="$name - $label"
+    [ -n "$size" ] && name="$name (${size})"
+
+    display_names+=("$name")
+    dev_paths+=("$devpath")
+done
+
+# 3. Kalau cuma satu drive, langsung proses tanpa perlu tanya
+if [ ${#usb_devs[@]} -eq 1 ]; then
+    selected_index=0
+    selected_name="${display_names[0]}"
+else
+    # 4. Tampilkan dialog pilihan (zenity GUI, fallback ke terminal select)
+    if command -v zenity >/dev/null 2>&1; then
+        # Build list dengan index tersembunyi sebagai kolom pertama
+        zenity_args=()
+        for i in "${!display_names[@]}"; do
+            zenity_args+=("$i" "${display_names[$i]}")
+        done
+
+        result=$(zenity --list \
+            --title="Eject Flashdisk" \
+            --text="Pilih flashdisk yang mau di-eject:" \
+            --column="ID" --column="Nama Drive" \
+            --hide-column=1 --print-column=1 \
+            --width=480 --height=320 \
+            "${zenity_args[@]}")
+
+        [ -z "$result" ] && exit 0
+        selected_index="$result"
+        selected_name="${display_names[$selected_index]}"
+    else
+        echo "Pilih flashdisk yang mau di-eject:"
+        select opt in "${display_names[@]}"; do
+            if [ -n "$opt" ]; then
+                for i in "${!display_names[@]}"; do
+                    if [ "${display_names[$i]}" == "$opt" ]; then
+                        selected_index=$i
+                        selected_name="$opt"
+                        break 2
+                    fi
+                done
+            fi
+        done
+    fi
+fi
+
+devpath="${dev_paths[$selected_index]}"
+
+# 5. Unmount semua partisi di disk yang dipilih
+partitions=$(lsblk -ln -o NAME "$devpath" 2>/dev/null | tail -n +2)
+unmount_failed=0
+
+for part in $partitions; do
+    if ! udisksctl unmount -b "/dev/$part" >/tmp/eject_unmount_err 2>&1; then
+        # Kalau errornya "not mounted", itu bukan masalah, lanjut saja
+        if ! grep -qi "not mounted" /tmp/eject_unmount_err; then
+            unmount_failed=1
+        fi
+    fi
+done
+
+# 6. Power off drive (setara "safely remove" - mematikan power USB-nya sekalian)
+if udisksctl power-off -b "$devpath" >/tmp/eject_poweroff_err 2>&1; then
+    notify "Eject USB" "Berhasil: $selected_name aman untuk dicabut." "drive-removable-media"
+else
+    err=$(cat /tmp/eject_poweroff_err)
+    notify "Eject USB" "Gagal eject $selected_name: $err" "dialog-error"
+fi
+
+rm -f /tmp/eject_unmount_err /tmp/eject_poweroff_err
